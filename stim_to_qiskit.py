@@ -83,9 +83,17 @@ def stim_to_qiskit(stim_circuit: stim.Circuit) -> tuple[QuantumCircuit, dict, li
         elif name == "X":
             for d in dense:
                 qc.x(d)
+                
+        elif name == "RX":
+        # reset to |+>: reset to |0>, then Hadamard
+            for d in dense:
+                qc.reset(d)
+                qc.h(d)
 
-        elif name in ("M", "MR"):
+        elif name in ("M", "MR", "MX"):
             for stim_q, d in zip(targets, dense):
+                if name == "MX":
+                    qc.h(d)
                 qc.measure(d, meas_idx)
                 meas_order.append(stim_q)
                 meas_idx += 1
