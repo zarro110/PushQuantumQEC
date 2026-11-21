@@ -63,6 +63,46 @@ DEFAULT_NOISE = dict(
 )
 
 
+def _strip_resets(circ: stim.Circuit) -> stim.Circuit:
+        """with-reset -> no-reset: MR->M, drop post-MR reset noise, rewrite DETECTORs."""
+        flat = circ.flattened()          # unroll REPEAT blocks
+        out = stim.Circuit()
+        n = 0                            # measurements seen so far
+        last_mr = {}                     # qubit -> abs index of its previous MR measurement
+        prev_of = {}                     # abs idx of an MR measurement -> previous one (or None)
+        just_after_mr = None
+        for inst in flat:
+            name = inst.name
+            if name == "MR":
+                targets = inst.targets_copy()
+                for t in targets:
+                    prev_of[n] = last_mr.get(t.value)
+                    last_mr[t.value] = n
+                    n += 1
+                out.append("M", targets, inst.gate_args_copy()) # M records result while not resetting the qubit
+                just_after_mr = targets
+                continue
+            if name == "X_ERROR" and just_after_mr is not None \
+                    and inst.targets_copy() == just_after_mr:
+                just_after_mr = None     # the post-MR reset flip -> drop it
+                continue
+            just_after_mr = None
+            if name == "DETECTOR":
+                idx = set()
+                for t in inst.targets_copy():
+                    j = n + t.value      # t.value is negative (rec[-k])
+                    idx ^= {j}
+                    if prev_of.get(j) is not None:
+                        idx ^= {prev_of[j]}      # s_k = m_k XOR m_(k-1)
+                out.append("DETECTOR",
+                           [stim.target_rec(j - n) for j in sorted(idx)],
+                           inst.gate_args_copy())
+                continue
+            n += inst.num_measurements
+            out.append(inst)
+        return out
+
+
 def make_stim_circuit(
     distance: int,
     rounds: int,
@@ -101,7 +141,19 @@ def make_stim_circuit(
     stim.Circuit
     """
 
-    return
+
+    # This generates a stim circuit in rotated_memory_X or Z
+    # _strip_resets rewrites Detectors and MR -> M
+    if basis.upper() not in ("Z", "X"):
+        raise ValueError("basis must be 'Z' or 'X'")
+    circ = stim.Circuit.generated(
+        f"surface_code:rotated_memory_{basis.lower()}",
+        distance=distance, rounds=rounds, **(noise or {}),
+    )
+    return _strip_resets(circ) if no_reset else circ
+    
+
+    return circuit
 
 def get_circuit_info(circuit: stim.Circuit) -> dict:
     """
@@ -155,6 +207,8 @@ def make_qiskit_circuit(
     -------
     qiskit.QuantumCircuit
     """
+
+    return stim_to_qiskit(make_stim_circuit(distance, rounds, basis, no_reset, noise=None))[0]
 
     return
 
