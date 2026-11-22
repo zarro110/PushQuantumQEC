@@ -90,7 +90,7 @@ def run_qiskit(
     provider   = IQMProvider(
         SERVER_URL,
         quantum_computer=quantum_computer,
-        token=token or TOKEN
+        token=TOKEN
     )
     backend    = provider.get_backend()
 
