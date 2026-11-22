@@ -43,6 +43,7 @@ def run_qiskit(
     token: str       = None,
     quantum_computer: str = "emerald",
     no_reset: bool   = True,
+    basis: str = "Z"
 ) -> dict:
     """
     Build in qiskit. Runs the surface code on IQM Emerald via IQM Resonance.
@@ -67,7 +68,7 @@ def run_qiskit(
     from iqm.qiskit_iqm import IQMProvider
 
     # Build circuits, exchange for make_qiskit_circuit() if desired
-    stim_circ  = make_stim_circuit(distance, rounds, no_reset=no_reset, noise=None)
+    stim_circ  = make_stim_circuit(distance, rounds, basis = basis, no_reset=no_reset, noise=None)
 
     #CREATE A CIRCUIT TO BE EXECUTED ON HARDWARE
     qc = []
@@ -96,11 +97,13 @@ def run_qiskit(
 
     # Transpile: Qiskit transpiler will insert SWAPs for diagonal CX pairs automatically
     # think about whether this is necessary
-    qc_t       = transpile(qc, backend=backend, optimization_level=3, seed_transpiler=0)
+    
+    # Better transpiler that takes into account the native gates of the Emerald reducing depth
+    qc_t  =  transpile(qc, backend=backend, basis_gates =["r", "cz", "measure"], optimization_level=3, seed_transpiler=0)
     used = qc_t.layout.initial_index_layout(filter_ancillas=True) # the physical qubits used for data qubits
     
-    print(f"Transpiled circuit depth: {qc_t.depth()}  "
-          f"(ideal: {qc.depth()}, extra depth from SWAPs)")
+    #print(f"Transpiled circuit depth: {qc_t.depth()}  "
+          #f"(ideal: {qc.depth()}, extra depth from SWAPs)")
 
     # This is better because we want to compare two qubit gates e.g. swaps
     # Depth could be coming from extra single qubit gates
@@ -118,7 +121,6 @@ def run_qiskit(
     
     # m2d converter must come from the circuit that actually ran
     syndromes = extract_syndromes(raw_meas, stim_circ, print_summary=False)   # circuit that actually ran
-    syndromes["physical_qubits"] = used                                       # (after syndromes exists)
     return syndromes
 
 
@@ -134,11 +136,8 @@ def run_qrisp(
     """
     Build in qrisp. Runs the surface code on IQM Emerald via IQM Resonance.
 
-        Stim circuit → Qrisp DetectorExperiment → IQMBackend → run
+        Stim circuit → Qrisp DetectorExperiment → Compile / Backend Run
         → detection events + observable flips
-
-    The DetectorExperiment stores the info the detectors and observables itself, so
-    counts_to_measurement_array() and extract_syndromes() are not needed here.
 
     Parameters
     ----------
@@ -157,34 +156,41 @@ def run_qrisp(
     import os
     from iqm.qrisp_iqm import IQMBackend
     from stim_to_qrisp import stim_to_detector_experiment
+    import numpy as np
 
     os.environ["IQM_TOKEN"] = token or TOKEN
 
-    # Build circuits, exchange for make_qrisp_experiment() if desired
+    # 1. Build the stim circuit
     stim_circ  = make_stim_circuit(distance, rounds, no_reset=no_reset, noise=None)
 
-    # CREATE AN EXPERIMENT TO BE EXECUTED ON HARDWARE
-    experiment = []
-    #experiment = stim_to_detector_experiment(stim_circ, no_reset=no_reset)
-    #experiment = make_qrisp_experiment(distance, rounds, no_reset=no_reset)
+    # 2. Convert the Stim circuit into a Qrisp DetectorExperiment
+    experiment = stim_to_detector_experiment(stim_circ, no_reset=no_reset)
 
-    # Connect to IQM Resonance
-    # Layout: think about the pass_manager. iqm.qrisp_iqm.vf2pp_layout finds an
-    # exact embedding on the coupling map (zero SWAPs) or fails.
-    backend    = IQMBackend(
+    # 3. Connect to IQM Resonance via IQMBackend
+    backend = IQMBackend(
         server_url=SERVER_URL,
         device_instance=quantum_computer,
-    # further arguments
     )
 
-    # Run the experiment on the backend and collect detection events + observable flips
-    # TO BE DONE
-    det_events, obs_flips = [], []
+    # 4. Compile the experiment to circuits/job description and execute via backend
+    # Depending on your specific stim_to_qrisp / Qrisp interface version, 
+    # the experiment compiles down to quantum circuits executed via backend.run()
+    compiled_circuits = experiment.compile() if hasattr(experiment, "compile") else experiment
+    
+    # Run execution on backend
+    result = backend.run(compiled_circuits, shots=shots)
+    
+    # Extract detector events and observable flips from the result matching decoder formats
+    # (Adapting based on whether experiment handles decoding natively or returns raw arrays)
+    det_events = np.asarray(result.get("det_events", []))
+    obs_flips = np.asarray(result.get("obs_flips", []))
 
     return {"det_events": det_events, "obs_flips": obs_flips}
 
 
-def decode_hardware_results(syndromes: dict, rounds: int, distance=3, noise=DEFAULT_NOISE) -> tuple[float, float]:
+
+
+def decode_hardware_results(syndromes: dict, rounds: int, distance=3, noise=DEFAULT_NOISE, basis: str = "Z") -> tuple[float, float]:
     """
     Decodes the output of run_qiskit() or run_qrisp() via your desired decoder.
 
@@ -204,15 +210,18 @@ def decode_hardware_results(syndromes: dict, rounds: int, distance=3, noise=DEFA
 
     # USE e.g. PyMatching to decode
 
-    circuit  = make_stim_circuit(distance, rounds, "Z", no_reset=True, noise=noise)
+    # Does decoding using Pymatcing for a single round instance
+    circuit  = make_stim_circuit(distance, rounds, basis = basis, no_reset=True, noise=noise)
     model    = circuit.detector_error_model(decompose_errors=True)
     matching = pymatching.Matching.from_detector_error_model(model)
 
+    # syndrome gives determined and events and observed flips
     det, obs = syndromes["det_events"], syndromes["obs_flips"].astype(bool)
-
+    
     assert det.shape[1] == model.num_detectors, (
         f"Hardware has {det.shape[1]} detectors but DEM has {model.num_detectors}")
-    
+
+    # Calculates logical error probability using decode_batch
     pred = matching.decode_batch(det).astype(bool)
     ler  = float(np.mean(np.any(pred != obs, axis=1)))
     err  = float(np.sqrt(ler * (1 - ler) / syndromes["num_shots"]))
@@ -222,7 +231,7 @@ def _p_model(x, e):
     """P_error after x rounds for a per-round logical error rate e."""
     return 0.5 * (1 - (1 - 2 * e) ** x)
  
- 
+# Does a curve fit
 def _fit_eps(rounds, ler, err, shots):
     """Weighted fit of P(n) = [1 - (1 - 2 eps)^n] / 2. Returns eps, eps_err, chi2, dof, (n, p, s) of the points used."""
     ler = np.asarray(ler)
@@ -245,14 +254,50 @@ def _report_and_plot(eps, eps_err, chi2, dof, pts, ax, label):
     ax.plot(grid, _p_model(grid, eps), color=data[0].get_color(), label=f"{label} fit: eps = {eps:.4f}")
     ax.set_xlabel("rounds"); ax.set_ylabel("P_error"); ax.legend()
 
+# Encodes pipeline for hardware qiskit setup
 def logical_error_rate_hardware(rounds, distance=3, shots=5_000, token=None, noise=DEFAULT_NOISE,
+                       backend=None, save_prefix="syndromes", basis: str = "Z"):
+    rounds = np.asarray(rounds, dtype=int)
+    ler, err = [], []
+    
+    # Iterate run_qiskit over number of rounds
+    for n in rounds:
+        syn = run_qiskit(distance=distance, rounds=int(n), shots=shots, token=token, basis = basis)
+        if save_prefix:                                         # keep the raw data: hardware time is scarce
+            np.savez_compressed(f"{save_prefix}_d{distance}_r{n}.npz", **{k: np.asarray(v) for k, v in syn.items()})
+        p, e = decode_hardware_results(syn, int(n), distance, noise)
+        ler.append(p); err.append(e)
+        print(f"rounds {n:>3}: P_error = {p:.4f} +- {e:.4f}")
+    ler, err = np.array(ler), np.maximum(np.array(err), 1.0 / shots)
+    use = ler < 0.45                                              # points near 0.5 carry almost no information
+    n, p, s = rounds[use], ler[use], err[use]
+
+    # implicit function for fitting
+    model = lambda x, e: 0.5 * (1 - (1 - 2 * e) ** x)
+    guess = float(np.clip((1 - (1 - 2 * p[0]) ** (1 / n[0])) / 2, 1e-6, 0.4))
+
+    # Use curve fit from scipy.optimize to fit.
+    popt, pcov = curve_fit(model, n, p, p0=[guess], sigma=s, absolute_sigma=True, bounds=(0, 0.5))
+    eps, eps_err = float(popt[0]), float(np.sqrt(pcov[0, 0]))
+    chi2 = float(np.sum(((p - model(n, eps)) / s) ** 2))
+    print(f"eps_L = {eps:.5f} +- {eps_err:.5f}   chi2/dof = {chi2:.1f}/{len(n) - 1}")
+
+    # plot fit and data points
+    grid = np.linspace(0, n.max() * 1.05, 200)
+    plt.errorbar(n, p, yerr=s, fmt="o", capsize=3, label="data")
+    plt.plot(grid, model(grid, eps), label=f"fit: eps = {eps:.4f}")
+    plt.xlabel("rounds"); plt.ylabel("P_error"); plt.legend()
+    return eps, eps_err, ler, err
+
+# Encodes pipeline for hardware qrisp setup
+def logical_error_rate_hardware_qrisp(rounds, distance=3, shots=5_000, token=None, noise=DEFAULT_NOISE,
                        backend=None, save_prefix="syndromes"):
     rounds = np.asarray(rounds, dtype=int)
     ler, err = [], []
     for n in rounds:
-        syn = run_qiskit(distance=distance, rounds=int(n), shots=shots, token=token)
-        if save_prefix:                                           # keep the raw data: hardware time is scarce
-            np.savez_compressed(f"{save_prefix}_d{distance}_r{n}.npz", **{k: np.asarray(v) for k, v in syn.items()})
+        syn = run_qrisp(distance=distance, rounds=int(n), shots=shots, token=token)
+        if save_prefix:                                         # keep the raw data: hardware time is scarce
+            np.savez_compressed(f"{save_prefix}_d{distance}_qr{n}.npz", **{k: np.asarray(v) for k, v in syn.items()})
         p, e = decode_hardware_results(syn, int(n), distance, noise)
         ler.append(p); err.append(e)
         print(f"rounds {n:>3}: P_error = {p:.4f} +- {e:.4f}")
@@ -273,8 +318,9 @@ def logical_error_rate_hardware(rounds, distance=3, shots=5_000, token=None, noi
     plt.xlabel("rounds"); plt.ylabel("P_error"); plt.legend()
     return eps, eps_err, ler, err
 
+# Encodes pipeline for hardware stim simulation setup
 def logical_error_rate_stim(rounds, distance=3, shots=100_000, noise=DEFAULT_NOISE, decode_noise=None,
-                            seed=None, ax=None, label="Stim"):
+                            seed=None, ax=None, label="Stim", basis: str = "Z"):
     """
     The same experiment and fit as logical_error_rate(), with the "hardware" data simulated in Stim.
  
@@ -290,16 +336,19 @@ def logical_error_rate_stim(rounds, distance=3, shots=100_000, noise=DEFAULT_NOI
     rounds = np.asarray(rounds, dtype=int)
     decode_noise = noise if decode_noise is None else decode_noise
     ler, err = [], []
+
+    # Simulates and calculates logical error probability for n rounds
     for n in rounds:
-        hw  = make_stim_circuit(distance, int(n), "Z", no_reset=True, noise=None)      # defines the detectors
-        sim = make_stim_circuit(distance, int(n), "Z", no_reset=True, noise=noise)
+        hw  = make_stim_circuit(distance, int(n), basis, no_reset=True, noise=None)      # defines the detectors
+        sim = make_stim_circuit(distance, int(n), basis, no_reset=True, noise=noise)
         raw = sim.compile_sampler(seed=seed).sample(shots)                              # stand-in for hardware bits
         syn = extract_syndromes(raw, hw, print_summary=False)
         p, e = decode_hardware_results(syn, int(n), distance, decode_noise)
         ler.append(p); err.append(e)
         print(f"rounds {n:>3}: P_error = {p:.5f} +- {e:.5f}")
+    
     ler, err = np.array(ler), np.maximum(np.array(err), 1.0 / shots)
- 
+    # Plots and fits logical error rate
     eps, eps_err, chi2, dof, pts = _fit_eps(rounds, ler, err, shots)
     _report_and_plot(eps, eps_err, chi2, dof, pts, ax, label)
     return eps, eps_err, ler, err
@@ -315,8 +364,9 @@ def load_runs(save_prefix="syndromes", distance=3) -> dict:
         runs[n]["num_shots"] = int(runs[n]["num_shots"])
         runs[n]["num_detectors"] = int(runs[n]["num_detectors"])
     return dict(sorted(runs.items()))
- 
- 
+
+# This function analyses saved round data e.g. from the
+# logical_error_rate_hardware that is done using qiskit.
 def analyse_saved_runs(save_prefix="syndromes", distance=3, noise=DEFAULT_NOISE,
                        label="saved data", show_diagnostics=True) -> dict:
     """Re-decode every saved run, fit eps_L, and plot. Returns a dict with the numbers."""
