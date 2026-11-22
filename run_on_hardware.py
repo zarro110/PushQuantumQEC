@@ -209,6 +209,33 @@ def decode_hardware_results(syndromes: dict, rounds: int, distance=3, noise=DEFA
     err  = float(np.sqrt(ler * (1 - ler) / syndromes["num_shots"]))
     return ler, err
 
+def _p_model(x, e):
+    """P_error after x rounds for a per-round logical error rate e."""
+    return 0.5 * (1 - (1 - 2 * e) ** x)
+ 
+ 
+def _fit_eps(rounds, ler, err, shots):
+    """Weighted fit of P(n) = [1 - (1 - 2 eps)^n] / 2. Returns eps, eps_err, chi2, dof, (n, p, s) of the points used."""
+    ler = np.asarray(ler)
+    err = np.maximum(np.asarray(err), 1.0 / shots)
+    use = ler < 0.45                                              # points near 0.5 carry almost no information
+    n, p, s = rounds[use], ler[use], err[use]
+    guess = float(np.clip((1 - (1 - 2 * p[0]) ** (1 / n[0])) / 2, 1e-6, 0.4))
+    popt, pcov = curve_fit(_p_model, n, p, p0=[guess], sigma=s, absolute_sigma=True, bounds=(0, 0.5))
+    eps, eps_err = float(popt[0]), float(np.sqrt(pcov[0, 0]))
+    chi2 = float(np.sum(((p - _p_model(n, eps)) / s) ** 2))
+    return eps, eps_err, chi2, len(n) - 1, (n, p, s)
+ 
+ 
+def _report_and_plot(eps, eps_err, chi2, dof, pts, ax, label):
+    print(f"[{label}] eps_L = {eps:.5f} +- {eps_err:.5f}   chi2/dof = {chi2:.1f}/{dof}")
+    ax = plt.gca() if ax is None else ax
+    n, p, s = pts
+    grid = np.linspace(0, n.max() * 1.05, 200)
+    data = ax.errorbar(n, p, yerr=s, fmt="o", capsize=3, label=f"{label} data")
+    ax.plot(grid, _p_model(grid, eps), color=data[0].get_color(), label=f"{label} fit: eps = {eps:.4f}")
+    ax.set_xlabel("rounds"); ax.set_ylabel("P_error"); ax.legend()
+
 def logical_error_rate_hardware(rounds, distance=3, shots=5_000, token=None, noise=DEFAULT_NOISE,
                        backend=None, save_prefix="syndromes"):
     rounds = np.asarray(rounds, dtype=int)
