@@ -1,6 +1,13 @@
 import numpy as np
 import stim
 
+from qiskit_ibm_runtime.fake_provider import FakeBoston
+backend = FakeBoston()
+simulator = AerSimulator()
+sim_boston = AerSimulator.from_backend(backend)
+aer_circ = transpile(qiskit_circuit, simulator)
+result = simulator.run(aer_circ).result()
+counts = result.get_counts(aer_circ)
 
 def extract_syndromes(
     raw_meas: np.ndarray,
