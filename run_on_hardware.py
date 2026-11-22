@@ -6,15 +6,24 @@ from qiskit import transpile
 from qiskit.transpiler import PassManager
 from qiskit.transpiler.passes import RemoveResetInZeroState
  
-from surface_code import make_stim_circuit, DEFAULT_NOISE
+from surface_code import make_stim_circuit
 from stim_to_qiskit import stim_to_qiskit
 from extract_syndromes import extract_syndromes
-from internal_helpers import counts_to_measurement_array
-from aer_noise import classical_readout
+from internal_helpers import counts_to_measurements
+
+import glob
+import re
 
 
 TOKEN = "p8rSyk3UBMSFgEAFnAQBMfRCwOYanmb9msOtVCqWaSkBof25/uJ3TKkrE5jtG7jk"
 SERVER_URL = "https://resonance.iqm.tech"
+
+DEFAULT_NOISE = dict(
+    after_clifford_depolarization  = 0.03,
+    after_reset_flip_probability   = 0.03,
+    before_measure_flip_probability= 0.03,
+    before_round_data_depolarization = 0.03,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -69,13 +78,13 @@ def run_qiskit(
 
     # OPTIONAL: IF YOU WANT TO ASSIGN QUBIT MAP BY HAND
     # Map abstract Qiskit qubits to emerald physical qubits
-    qubit_map  = build_emerald_qubit_map(stim_circ)
+    #qubit_map  = build_emerald_qubit_map(stim_circ)
 
     # HIGHLY RECOMMEND PRINTING THIS, if you are using it.
     # print(qubit_map)
     # initial_layout: Qiskit needs a list where position i = physical qubit for logical i
-    n_qubits   = qc.num_qubits
-    layout     = [qubit_map.get(i, i) for i in range(n_qubits)]
+    #n_qubits   = qc.num_qubits
+    #layout     = [qubit_map.get(i, i) for i in range(n_qubits)]
 
     # Connect to IQM Resonance
     provider   = IQMProvider(
@@ -195,7 +204,7 @@ def decode_hardware_results(syndromes: dict, rounds: int, distance=3, noise=DEFA
 
     # USE e.g. PyMatching to decode
 
-    circuit  = classical_readout(make_stim_circuit(distance, rounds, "Z", no_reset=True, noise=noise))
+    circuit  = make_stim_circuit(distance, rounds, "Z", no_reset=True, noise=noise)
     model    = circuit.detector_error_model(decompose_errors=True)
     matching = pymatching.Matching.from_detector_error_model(model)
 
@@ -241,7 +250,7 @@ def logical_error_rate_hardware(rounds, distance=3, shots=5_000, token=None, noi
     rounds = np.asarray(rounds, dtype=int)
     ler, err = [], []
     for n in rounds:
-        syn = run_qiskit(distance=distance, rounds=int(n), shots=shots, token=token, backend=backend)
+        syn = run_qiskit(distance=distance, rounds=int(n), shots=shots, token=token)
         if save_prefix:                                           # keep the raw data: hardware time is scarce
             np.savez_compressed(f"{save_prefix}_d{distance}_r{n}.npz", **{k: np.asarray(v) for k, v in syn.items()})
         p, e = decode_hardware_results(syn, int(n), distance, noise)
@@ -283,7 +292,7 @@ def logical_error_rate_stim(rounds, distance=3, shots=100_000, noise=DEFAULT_NOI
     ler, err = [], []
     for n in rounds:
         hw  = make_stim_circuit(distance, int(n), "Z", no_reset=True, noise=None)      # defines the detectors
-        sim = classical_readout(make_stim_circuit(distance, int(n), "Z", no_reset=True, noise=noise))
+        sim = make_stim_circuit(distance, int(n), "Z", no_reset=True, noise=noise)
         raw = sim.compile_sampler(seed=seed).sample(shots)                              # stand-in for hardware bits
         syn = extract_syndromes(raw, hw, print_summary=False)
         p, e = decode_hardware_results(syn, int(n), distance, decode_noise)
@@ -294,3 +303,68 @@ def logical_error_rate_stim(rounds, distance=3, shots=100_000, noise=DEFAULT_NOI
     eps, eps_err, chi2, dof, pts = _fit_eps(rounds, ler, err, shots)
     _report_and_plot(eps, eps_err, chi2, dof, pts, ax, label)
     return eps, eps_err, ler, err
+
+def load_runs(save_prefix="syndromes", distance=3) -> dict:
+    """{rounds: {key: array}} for every file `<save_prefix>_d<distance>_r<rounds>.npz`, sorted by rounds."""
+    runs = {}
+    # FIX: added '*' between 'r' and '.npz'
+    for path in glob.glob(f"{save_prefix}_d{distance}_r*.npz"):
+        n = int(re.search(r"_r(\d+)\.npz$", path).group(1))
+        with np.load(path) as f:
+            runs[n] = {k: f[k] for k in f.files}
+        runs[n]["num_shots"] = int(runs[n]["num_shots"])
+        runs[n]["num_detectors"] = int(runs[n]["num_detectors"])
+    return dict(sorted(runs.items()))
+ 
+ 
+def analyse_saved_runs(save_prefix="syndromes", distance=3, noise=DEFAULT_NOISE,
+                       label="saved data", show_diagnostics=True) -> dict:
+    """Re-decode every saved run, fit eps_L, and plot. Returns a dict with the numbers."""
+    runs = load_runs(save_prefix, distance)
+    if not runs:
+        raise FileNotFoundError(f"no files matching {save_prefix}_d{distance}_r*.npz")
+    rounds = np.array(list(runs))
+ 
+    ler, err, raw_flip = [], [], []
+    for n, syn in runs.items():
+        p, e = decode_hardware_results(syn, int(n), distance, noise)
+        ler.append(p); err.append(e)
+        raw_flip.append(float(syn["obs_flips"].mean()))              # logical flip rate BEFORE decoding
+        print(f"rounds {n:>3}: shots {syn['num_shots']:>6}  decoded P_error = {p:.4f} +- {e:.4f}   "
+              f"raw logical flips = {raw_flip[-1]:.4f}")
+    shots = min(s["num_shots"] for s in runs.values())
+    ler, err, raw_flip = np.array(ler), np.maximum(np.array(err), 1.0 / shots), np.array(raw_flip)
+ 
+    sets = {tuple(int(q) for q in s["physical_qubits"]) for s in runs.values() if "physical_qubits" in s}
+    if len(sets) > 1:
+        print(f"WARNING: the runs used {len(sets)} different sets of physical qubits; the round-dependence "
+              f"is then mixed with hardware differences. Pass a fixed initial_layout.")
+ 
+    eps, eps_err, chi2, dof, pts = _fit_eps(rounds, ler, err, shots)
+ 
+    if show_diagnostics:
+        fig, axs = plt.subplots(1, 3, figsize=(16, 4.2))
+        _report_and_plot(eps, eps_err, chi2, dof, pts, axs[0], label)
+        axs[0].plot(rounds, raw_flip, "s", mfc="none", color="gray", label="raw (undecoded) flips")
+        axs[0].legend(); axs[0].set_title("logical error vs rounds")
+ 
+        rate = []                                                     # interior rounds only: the first and last
+        for n, s in runs.items():                                     # round have different detectors and rates
+            c = make_stim_circuit(distance, int(n), "Z", no_reset=True, noise=None).get_detector_coordinates()
+            tt = np.array([c[i][2] for i in range(len(c))])
+            rate.append(float(np.asarray(s["detector_firing_rate"])[(tt > 0) & (tt < n)].mean()))
+        axs[1].plot(rounds, rate, "o-")
+        axs[1].set_xlabel("rounds"); axs[1].set_ylabel("mean firing rate, interior rounds")
+        axs[1].set_title("drift check (flat = stable)")
+ 
+        n_max = int(rounds.max())                                     # time profile inside the longest run
+        coords = make_stim_circuit(distance, n_max, "Z", no_reset=True, noise=None).get_detector_coordinates()
+        t = np.array([coords[i][2] for i in range(len(coords))])
+        fr = np.asarray(runs[n_max]["detector_firing_rate"])
+        axs[2].plot(sorted(set(t)), [fr[t == k].mean() for k in sorted(set(t))], "o-")
+        axs[2].set_xlabel("round index"); axs[2].set_ylabel("mean detector firing rate")
+        axs[2].set_title(f"inside the {n_max}-round run")
+        fig.tight_layout()
+ 
+    return dict(rounds=rounds, ler=ler, err=err, raw_flip=raw_flip, eps=eps, eps_err=eps_err,
+                chi2=chi2, dof=dof, physical_qubit_sets=sets)
