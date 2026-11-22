@@ -60,6 +60,9 @@ def stim_to_qiskit(stim_circuit: stim.Circuit) -> tuple[QuantumCircuit, dict, li
 
         # Extract qubit targets (ignore measurement-record targets in M gates)
         targets = [t.value for t in instr.targets_copy() if t.is_qubit_target]
+        # print("============")
+        # print(targets)
+        # print(stim_to_dense)
         dense   = [stim_to_dense[t] for t in targets]
 
         if name == "R":

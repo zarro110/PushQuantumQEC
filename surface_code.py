@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+
 from internal_helpers import *
 
 """
@@ -49,6 +50,16 @@ from qiskit import QuantumCircuit, transpile
 from typing import Optional
 
 
+from stim_to_qiskit import stim_to_qiskit
+from build_emerald_qubit_rotated import build_emerald_qubit_map
+from extract_syndromes import extract_syndromes
+
+from qiskit_aer import AerSimulator
+from qiskit.visualization import plot_histogram, plot_state_city
+import qiskit.quantum_info as qi
+
+import matplotlib.pyplot as plt
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  1.  STIM CIRCUIT GENERATION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -62,6 +73,69 @@ DEFAULT_NOISE = dict(
     before_round_data_depolarization = 0.003,
 )
 
+
+def make_stim_circuit_old(
+    distance: int,
+    rounds: int,
+    basis: str = "Z",
+    no_reset: bool = True,
+    noise: Optional[dict] = None,
+) -> stim.Circuit:
+    """
+    Generates a Stim circuit for the rotated surface code.
+
+    Shared starting point for BOTH tracks. A Stim circuit does not run on hardware, you need to convert it first
+    first:
+        Qiskit track : stim_to_qiskit(stim_circ)               (stim_to_qiskit.py)
+        Qrisp track  : stim_to_detector_experiment(stim_circ)  (stim_to_qrisp.py)
+    Alternatively, you can start from make_qiskit_circuit() / make_qrisp_experiment().
+
+    Parameters
+    ----------
+    distance : code distance
+    rounds   : number of stabilizer rounds
+    basis    : "Z" or "X" memory experiment NOTE: Stim's X-memory circuits use RX / MX,
+             which the provided converters do not handle. Possible avenue for extension.
+    no_reset : True -> ancillas are measured without reset (required on Emerald)
+    noise    : None for the hardware circuit. For for simulation / DEM it can be  e.g. DEFAULT_NOISE or sophisticated choices.
+
+    NOTE: Emerald does not support mid-circuit reset, so the circuit that runs on hardware must be the no-reset variant.
+    With reset: ancilla starts fresh each round. Raw measurement m_k = syndrome s_k of round k. Detection event = s_k XOR s_(k-1) = m_k XOR m_(k-1).
+    Without reset: ancilla accumulates. Raw measurement m_k = s_k XOR m_(k-1), i.e. the XOR of all syndromes up to round k.
+    The detection event is the same quantity (s_k XOR s_(k-1)), but in raw measurements it becomes m_k XOR m_(k-2)  (with m_0 = 0).
+    So the DETECTOR definitions must be rewritten for the no-reset circuit. stim_to_qrisp.py does this rewrite for you (PLEASE VERIFY!); on the Qiskit track it is on you.
+    Trade-off: no-reset avoids reset errors (X_ERROR after R), but the ancilla stays "live" (potentially decohering) throughout, which causes amplitude damping.
+
+
+    Returns
+    -------
+    stim.Circuit
+    """
+
+    if noise is None:
+       noise = dict(
+        after_clifford_depolarization  = 0.003,
+        after_reset_flip_probability   = 0.003,
+        before_measure_flip_probability= 0.003,
+        before_round_data_depolarization = 0.003,
+      )
+
+    basis_code = ""
+    if basis == "Z":
+        basis_code = "surface_code:rotated_memory_z"
+    elif basis == "X":
+        basis_code = "surface_code:rotated_memory_x"
+
+    circuit_initial = stim.Circuit.generated("surface_code:rotated_memory_x", 
+                                            distance=distance, 
+                                            rounds=rounds, 
+                                            after_clifford_depolarization = noise["after_clifford_depolarization"],
+                                            before_round_data_depolarization = noise["before_round_data_depolarization"],
+                                            after_reset_flip_probability = noise["after_reset_flip_probability"],
+                                            before_measure_flip_probability = noise["before_measure_flip_probability"] )
+
+
+    return circuit_initial
 
 def make_stim_circuit(
     distance: int,
@@ -101,7 +175,59 @@ def make_stim_circuit(
     stim.Circuit
     """
 
-    return
+    
+    def _strip_resets(circ: stim.Circuit) -> stim.Circuit:
+        """with-reset -> no-reset: MR->M, drop post-MR reset noise, rewrite DETECTORs."""
+        flat = circ.flattened()          # unroll REPEAT blocks
+        out = stim.Circuit()
+        n = 0                            # measurements seen so far
+        last_mr = {}                     # qubit -> abs index of its previous MR measurement
+        prev_of = {}                     # abs idx of an MR measurement -> previous one (or None)
+        just_after_mr = None
+        for inst in flat:
+            name = inst.name
+            if name == "MR":
+                targets = inst.targets_copy()
+                for t in targets:
+                    prev_of[n] = last_mr.get(t.value)
+                    last_mr[t.value] = n
+                    n += 1
+                out.append("M", targets, inst.gate_args_copy()) # M records result while not resetting the qubit
+                just_after_mr = targets
+                continue
+            if name == "X_ERROR" and just_after_mr is not None \
+                    and inst.targets_copy() == just_after_mr:
+                just_after_mr = None     # the post-MR reset flip -> drop it
+                continue
+            just_after_mr = None
+            if name == "DETECTOR":
+                idx = set()
+                for t in inst.targets_copy():
+                    j = n + t.value      # t.value is negative (rec[-k])
+                    idx ^= {j}
+                    if prev_of.get(j) is not None:
+                        idx ^= {prev_of[j]}      # s_k = m_k XOR m_(k-1)
+                out.append("DETECTOR",
+                           [stim.target_rec(j - n) for j in sorted(idx)],
+                           inst.gate_args_copy())
+                continue
+            n += inst.num_measurements
+            out.append(inst)
+        return out
+
+
+    # This generates a stim circuit in rotated_memory_X or Z
+    # _strip_resets rewrites Detectors and MR -> M
+    if basis.upper() not in ("Z", "X"):
+        raise ValueError("basis must be 'Z' or 'X'")
+    circ = stim.Circuit.generated(
+        f"surface_code:rotated_memory_{basis.lower()}",
+        distance=distance, rounds=rounds, **(noise or {}),
+    )
+    return _strip_resets(circ) if no_reset else circ
+
+    
+    return circuit
 
 def get_circuit_info(circuit: stim.Circuit) -> dict:
     """
@@ -201,23 +327,46 @@ def make_qrisp_experiment(
 # Below the necessary steps. No need to put everything in this file. 
 ##########################
 
+distance = 3
+rounds = 1
+basis = "Z"
+no_reset = True
+noise = None
+
+stim_circuit = make_stim_circuit(distance, rounds, basis, no_reset, noise)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  2.  STIM → Qrisp/QISKIT CONVERSION
 # ─────────────────────────────────────────────────────────────────────────────
 
-# TBD
+qiskit_circuit, stim_to_dense, meas_order = stim_to_qiskit(stim_circuit)
 
+qiskit_circuit.draw(output="mpl")
+plt.plot()
 # ─────────────────────────────────────────────────────────────────────────────
 #  3.  EMERALD QUBIT MAPPING
 # ─────────────────────────────────────────────────────────────────────────────
 
-# TBD
+#Em_qubit_map = build_emerald_qubit_map()
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  4.  STIM/AER SIMULATION  (no hardware needed)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# TBD
+simulator = AerSimulator()
+aer_circ = transpile(qiskit_circuit, simulator)
+result = simulator.run(aer_circ).result()
+#counts = result.get_counts(aer_circ)
+#plot_histogram(counts, title='results')
+#plt.show()
+
+
+
+print(result)
+
+
+syndromes = extract_syndromes(result.get_counts(aer_circ), stim_circuit)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  5.  Hardware execution

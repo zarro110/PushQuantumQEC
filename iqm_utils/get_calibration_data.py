@@ -5,11 +5,13 @@ from iqm.qubit_selector.qiskit_utils import get_circuit, CircuitType
 from iqm.qiskit_iqm import IQMProvider
 
 # Input your Resonance token
-token = "" # Replace with your actual token
-os.environ["IQM_TOKEN"] = token
+#token = "WPQmSui9oOgOHbYdAK6ifESf8GUmvFyAAyyEm/wanpEBof/7E7twA5LISX7dO1ep" # Replace with your actual token
+#os.environ["IQM_TOKEN"] = token
 
-iqm_server_url = "https://resonance.meetiqm.com"  # Replace with your IQM server URL
-quantum_computer = "garnet"  # Replace with your quantum computer name if needed
+#api_token = os.environ.get("IQM_TOKEN")
+#print(api_token)
+iqm_server_url = "https://resonance.iqm.tech"  # Replace with your IQM server URL
+quantum_computer = "emerald"  # Replace with your quantum computer name if needed
 provider = IQMProvider(iqm_server_url, quantum_computer = quantum_computer)
 backend = provider.get_backend()
 
@@ -42,5 +44,6 @@ def plot_calibration_data(key, data):
     plt.tight_layout()
     plt.show()
 
-
+print(calibration_data)
 print(backend.coupling_map)
+plot_calibration_data(*calibration_data['CZ'])
